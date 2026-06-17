@@ -1079,19 +1079,48 @@ function Analyze-Xsl {
         $label = ''
         if ($bind) { $label = Get-LeadingLabel $txt $m.Index }
         # Unconditional read-only.
-        if ($bind -and $tag -match 'xd:disableEditing="yes"') { $readonly += [pscustomobject]@{ Field = $bind; Condition = '' } }
+        if ($bind -and $tag -match 'xd:disableEditing="yes"') { $readonly += [pscustomobject]@{ Field = $bind; Condition = ''; Caption = '' } }
         $controls += [pscustomobject]@{ Control = $ct; Field = $bind; Label = $label }
     }
-    # Conditional read-only: <xsl:attribute name="disabled"> ... test="COND" ... </xsl:attribute>,
+
+    # Formatting rule captions (human-readable names) from 'style' attributes.
+    $ruleCaptions = @{}
+    foreach ($sm in [regex]::Matches($txt, '(?s)<xsl:attribute name="style">.*?</xsl:attribute>')) {
+        $before = $txt.Substring(0, $sm.Index)
+        $bm = [regex]::Matches($before, 'xd:binding="(?<b>[^"]*)"')
+        if ($bm.Count -eq 0) { continue }
+        $fld = Leaf-Name $bm[$bm.Count - 1].Groups['b'].Value
+        foreach ($m in [regex]::Matches($sm.Value, 'test="(?<c>[^"]+)"[^>]*>caption:\s*(?<cap>[^<]+)</xsl:')) {
+            $cond = $m.Groups['c'].Value
+            if (-not $ruleCaptions[$fld]) { $ruleCaptions[$fld] = @{} }
+            $ruleCaptions[$fld][$cond] = $m.Groups['cap'].Value.Trim()
+        }
+    }
+
+    # Conditional read-only / disabled: <xsl:attribute name="disabled"> or "contentEditable",
     # attributed to the nearest preceding bound control.
-    foreach ($dm in [regex]::Matches($txt, '(?s)<xsl:attribute name="disabled">(?<body>.*?)</xsl:attribute>')) {
-        $tm = [regex]::Match($dm.Groups['body'].Value, 'test="(?<c>[^"]{2,300})"')
-        if (-not $tm.Success) { continue }
-        $before = $txt.Substring(0, $dm.Index)
-        $bm2 = [regex]::Matches($before, 'xd:binding="(?<b>[^"]*)"')
-        if ($bm2.Count -eq 0) { continue }
-        $fld = Leaf-Name $bm2[$bm2.Count - 1].Groups['b'].Value
-        if ($fld) { $readonly += [pscustomobject]@{ Field = $fld; Condition = $tm.Groups['c'].Value } }
+    foreach ($m in [regex]::Matches($txt, '(?s)<xsl:attribute name="(disabled|contentEditable)">.*?</xsl:attribute>')) {
+        $attrName = $m.Groups[1].Value
+        $attrBody = $m.Value
+        $before = $txt.Substring(0, $m.Index)
+        $bm = [regex]::Matches($before, 'xd:binding="(?<b>[^"]*)"')
+        if ($bm.Count -eq 0) { continue }
+        $fld = Leaf-Name $bm[$bm.Count - 1].Groups['b'].Value
+        # disabled="true" or contentEditable="false"
+        $isReadOnly = ($attrName -eq 'disabled' -and $attrBody -match '>true<') -or ($attrName -eq 'contentEditable' -and $attrBody -match '>false<')
+        if (-not $isReadOnly) { continue }
+
+        $cond = ""; $tm = [regex]::Match($attrBody, 'test="(?<c>[^"]+)"')
+        if ($tm.Success) { $cond = $tm.Groups['c'].Value }
+        else {
+            # Case B: condition is in a parent xsl:if or xsl:when
+            $around = $txt.Substring([Math]::Max(0, $m.Index - 500), 500)
+            $tm2 = [regex]::Matches($around, 'test="(?<c>[^"]+)"'); if ($tm2.Count -gt 0) { $cond = $tm2[$tm2.Count - 1].Groups['c'].Value }
+        }
+        if ($cond) {
+            $cap = ""; if ($ruleCaptions[$fld] -and $ruleCaptions[$fld][$cond]) { $cap = $ruleCaptions[$fld][$cond] }
+            $readonly += [pscustomobject]@{ Field = $fld; Condition = $cond; Caption = $cap }
+        }
     }
 
     # Sections / repeating
@@ -1393,9 +1422,13 @@ function Analyze-Form {
         foreach ($ro in $xa.Readonly) {
             $fld = Leaf-Name $ro.Field
             if ($ro.Condition) {
-                $readonlyRows += [pscustomobject]@{ View = $v.View; Field = $fld; ReadOnlyWhen = "When " + (To-PlainExpr $ro.Condition); DerivedDisplayMode = "If(" + (To-PowerFx $ro.Condition) + ", DisplayMode.View, DisplayMode.Edit)" }
+                $readonlyRows += [pscustomobject]@{
+                    View = $v.View; Field = $fld; Rule = $ro.Caption
+                    ReadOnlyWhen = "When " + (To-PlainExpr $ro.Condition)
+                    DerivedDisplayMode = "If(" + (To-PowerFx $ro.Condition) + ", DisplayMode.View, DisplayMode.Edit)"
+                }
             } else {
-                $readonlyRows += [pscustomobject]@{ View = $v.View; Field = $fld; ReadOnlyWhen = 'Always (read-only)'; DerivedDisplayMode = 'DisplayMode.View' }
+                $readonlyRows += [pscustomobject]@{ View = $v.View; Field = $fld; Rule = ''; ReadOnlyWhen = 'Always (read-only)'; DerivedDisplayMode = 'DisplayMode.View' }
             }
         }
     }
