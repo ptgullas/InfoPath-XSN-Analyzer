@@ -754,8 +754,19 @@ function Get-Logic {
             }
             $actionText = ($actions -join '; ')
             if (-not $actionText) { $actionText = '(no actions)' }
+
+            # Find which views this rule might "appear" on based on its trigger field or button.
+            $viewsForTrigger = ''
+            if ($trigger -match '\[(?<f>[^\]]+)\]') {
+                $tf = $Matches['f']
+                if ($fieldUsage -and $fieldUsage.ContainsKey($tf)) { $viewsForTrigger = ($fieldUsage[$tf] | Select-Object -Unique) -join ', ' }
+            } elseif ($trigger -match "on view '(?<v>[^']+)'") {
+                $viewsForTrigger = $Matches['v']
+            }
+
             $rows += [pscustomobject]@{
                 Trigger = $trigger
+                Views = $viewsForTrigger
                 Rule = $caption
                 Condition = $(if ($cond) { 'IF ' + $cond } else { '(always)' })
                 Actions = $actionText
@@ -1081,6 +1092,13 @@ function Analyze-Xsl {
         # Unconditional read-only.
         if ($bind -and $tag -match 'xd:disableEditing="yes"') { $readonly += [pscustomobject]@{ Field = $bind; Condition = ''; Caption = '' } }
         $controls += [pscustomobject]@{ Control = $ct; Field = $bind; Label = $label }
+
+        # Capture button-triggered ruleSets
+        $rsAction = [regex]::Match($tag, 'xd:xdxsfAction="(?<rs>[^"]*)"')
+        if ($rsAction.Success) {
+            $rsName = $rsAction.Groups['rs'].Value
+            $controls += [pscustomobject]@{ Control = "Rule Trigger ($rsName)"; Field = $bind; Label = $label }
+        }
     }
 
     # Formatting rule captions (human-readable names) from 'style' attributes.
@@ -1368,10 +1386,6 @@ function Analyze-Form {
     $primary = $null; try { $primary = Get-PrimaryFields $root $nsm } catch { Log-Issue $name 'PrimaryFields' $_.Exception.Message }
     $views = @(); try { $views = @(Get-Views $root $nsm) } catch { Log-Issue $name 'Views' $_.Exception.Message }
     $rsTrig = @{}; try { $rsTrig = Build-RuleSetTriggers $root $nsm } catch { Log-Issue $name 'Triggers' $_.Exception.Message }
-    $logic = $null; try { $logic = Get-Logic $root $nsm $rsTrig } catch { Log-Issue $name 'Logic' $_.Exception.Message }
-    $onLoad = @(); try { $onLoad = @(Get-OnLoadSummary $root $nsm $adapters) } catch { Log-Issue $name 'OnLoad' $_.Exception.Message }
-    $events = @(); try { $events = @(Get-EventHandlers $root $nsm) } catch { Log-Issue $name 'Events' $_.Exception.Message }
-    $calcs = @(); try { $calcs = @(Get-Calculations $root $nsm) } catch { Log-Issue $name 'Calcs' $_.Exception.Message }
     $valid = @(); try { $valid = @(Get-Validation $root $nsm) } catch { Log-Issue $name 'Validation' $_.Exception.Message }
     $schemaFields = @(); try { $schemaFields = @(Get-SchemaFields $folder $root $nsm) } catch { Log-Issue $name 'SchemaFields' $_.Exception.Message }
     $structure = @(); try { $structure = @(Get-FormStructure $folder $root $nsm) } catch { Log-Issue $name 'Structure' $_.Exception.Message }
@@ -1384,6 +1398,7 @@ function Analyze-Form {
     $visibilityRows = @()
     $dropdownRows = @()
     $readonlyRows = @()
+    $buttonTriggers = @{}
     $sectionTotal = 0
     $fieldUsage = @{}        # field -> list of views
     $controlByField = @{}    # field -> friendly control type (rich text, date picker, attachment...)
@@ -1396,6 +1411,13 @@ function Analyze-Form {
         if ($null -eq $xa) { continue }
         $sectionTotal += $xa.SectionCount
         foreach ($c in $xa.Controls) {
+            if ($c.Control -match 'Rule Trigger \((?<rs>.*)\)') {
+                $rsName = $Matches['rs']
+                if (-not $buttonTriggers.ContainsKey($rsName)) { $buttonTriggers[$rsName] = @() }
+                $lbl = $c.Label; if (-not $lbl) { $lbl = "Button" }
+                $buttonTriggers[$rsName] += "Click '$lbl' on view '$($v.View)'"
+                continue
+            }
             if (-not $c.Field) { continue }
             $fc = Friendly-Control $c.Control
             if ($fc -and $fc -ne 'Button' -and $fc -ne 'Section' -and -not $controlByField.ContainsKey($c.Field)) { $controlByField[$c.Field] = $fc }
@@ -1433,6 +1455,19 @@ function Analyze-Form {
         }
     }
     $readonlyRows = @($readonlyRows | Sort-Object View, Field, ReadOnlyWhen -Unique)
+
+    # Merge button triggers into ruleSet triggers
+    foreach ($rs in $buttonTriggers.Keys) {
+        $trig = ($buttonTriggers[$rs] | Select-Object -Unique) -join '; '
+        if ($rsTrig.ContainsKey($rs)) { $rsTrig[$rs] += " (also: $trig)" }
+        else { $rsTrig[$rs] = $trig }
+    }
+
+    # ---- logic analysis (requires fieldUsage from XSL analysis) ----
+    $logic = $null; try { $logic = Get-Logic $root $nsm $rsTrig } catch { Log-Issue $name 'Logic' $_.Exception.Message }
+    $onLoad = @(); try { $onLoad = @(Get-OnLoadSummary $root $nsm $adapters) } catch { Log-Issue $name 'OnLoad' $_.Exception.Message }
+    $events = @(); try { $events = @(Get-EventHandlers $root $nsm) } catch { Log-Issue $name 'Events' $_.Exception.Message }
+    $calcs = @(); try { $calcs = @(Get-Calculations $root $nsm) } catch { Log-Issue $name 'Calcs' $_.Exception.Message }
 
     # ---- merge fields (list columns + schema), mark usage / unused / logic-only ----
     # collect every field name referenced by any logic expression (rules/calcs/validation/conditions)
