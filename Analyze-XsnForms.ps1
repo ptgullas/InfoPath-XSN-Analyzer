@@ -827,8 +827,12 @@ function Get-Validation {
         $msg = ''
         $m = Sel1 $e './xsf:errorMessage' $Nsm
         if ($m) { $msg = Get-Attr $m 'shortMessage' }
+        $caption = ''
+        $c = Sel1 $e './processing-instruction("caption")' $Nsm
+        if ($c) { $caption = $c.Data.Trim() }
         $rows += [pscustomobject]@{
             Field = $field
+            Rule = $caption
             FailsWhen = To-PlainExpr (Get-Attr $e 'expression')
             Message = $msg
         }
@@ -1502,6 +1506,19 @@ function Analyze-Form {
         if ($section -and -not $sectionByField.ContainsKey($s.Name)) { $sectionByField[$s.Name] = $section }
     }
 
+    # field -> human-readable validation-based requirements
+    $validationReqs = @{}
+    foreach ($v in $valid) {
+        # 'cannot be blank' rules (requiredness)
+        if ($v.FailsWhen -match 'is (blank|empty|""|"")' -or $v.FailsWhen -match '= ""' -or $v.Message -match 'Cannot be blank') {
+            if (-not $validationReqs.ContainsKey($v.Field)) { $validationReqs[$v.Field] = @() }
+            $label = $v.Rule; if (-not $label) { $label = 'Required' }
+            # If condition mentions a view, tag it.
+            if ($v.FailsWhen -match 'view-name is "(?<v>[^"]+)"') { $label += " (on view '$($Matches['v'])')" }
+            $validationReqs[$v.Field] += $label
+        }
+    }
+
     $fieldRows = @()
     $fieldSeen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
     $complexCount = 0
@@ -1523,10 +1540,18 @@ function Analyze-Form {
         $lt = ''
         if ($f.PSObject.Properties.Name -contains 'LookupTarget') { $lt = $f.LookupTarget }
         $storage = $(if ($isListForm) { 'SharePoint column' } elseif ($promoted.ContainsKey($f.Name)) { "SharePoint column ($($promoted[$f.Name]))" } else { 'XML only' })
+        
+        $req = $(if ($f.Required) { 'Yes (schema)' } else { '' })
+        if ($validationReqs.ContainsKey($f.Name)) {
+            $vreq = ($validationReqs[$f.Name] | Select-Object -Unique) -join '; '
+            if ($req) { $req += "; " + $vreq } else { $req = "Conditional: " + $vreq }
+        }
+        if (-not $req) { $req = 'no' }
+
         $fieldRows += [pscustomobject]@{
             Section = $sectionByField[$f.Name]; Field = $f.Name; Label = $labelByField[$f.Name]; Type = $f.Type
             Control = $controlByField[$f.Name]; Storage = $storage; Complex = $f.IsComplex; LookupTarget = $lt
-            Required = $f.Required; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', '); Status = $status
+            Required = $req; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', '); Status = $status
         }
     }
     # add schema-only structural fields (library forms / repeating groups) not already covered
@@ -1540,10 +1565,18 @@ function Analyze-Form {
         $usedInViews = @()
         if ($fieldUsage.ContainsKey($f.Name)) { $usedInViews = $fieldUsage[$f.Name] | Select-Object -Unique }
         $storage = $(if ($isListForm) { 'SharePoint column' } elseif ($promoted.ContainsKey($f.Name)) { "SharePoint column ($($promoted[$f.Name]))" } else { 'XML only' })
+        
+        $req = $(if ($f.Nillable -eq $false) { 'Yes (schema)' } else { '' })
+        if ($validationReqs.ContainsKey($f.Name)) {
+            $vreq = ($validationReqs[$f.Name] | Select-Object -Unique) -join '; '
+            if ($req) { $req += "; " + $vreq } else { $req = "Conditional: " + $vreq }
+        }
+        if (-not $req) { $req = 'no' }
+
         $fieldRows += [pscustomobject]@{
             Section = $sectionByField[$f.Name]; Field = $f.Name; Label = $labelByField[$f.Name]; Type = $f.Type
             Control = $controlByField[$f.Name]; Storage = $storage; Complex = $false; LookupTarget = ''
-            Required = $false; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', ')
+            Required = $req; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', ')
             Status = $(if ($usedInViews.Count -gt 0) { 'Active' } elseif ($f.Repeating) { 'Repeating group' } else { 'Structure only' })
         }
     }
