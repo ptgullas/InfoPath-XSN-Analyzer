@@ -1926,7 +1926,7 @@ function Analyze-Form {
     $md += ''
     $md += '### Field list'
     $md += ''
-    $md += (@($fieldRows | Where-Object { $_.Status -eq 'Active' -and $_.Field } | Sort-Object Field | Select-Object -Unique) | ForEach-Object { "- $($_.Field)" }) -join "`n"
+    $md += (@($fieldRows | Where-Object { $_.Status -eq 'Active' -and $_.Field } | Select-Object -ExpandProperty Field | Sort-Object -Unique) | ForEach-Object { "- $_" }) -join "`n"
     $md += ''
     if (@($structure).Count -gt 0) {
         $md += '### Form layout (sections, fields, labels, controls - in form order)'

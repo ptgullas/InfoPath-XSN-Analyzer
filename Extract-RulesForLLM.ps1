@@ -158,27 +158,115 @@ foreach ($dir in $analysisDirs) {
         }
 
         if ($fieldCandidates.Count -gt 0) {
-            $rulesText = ($logicSection, $validationSection, $readOnlySection, $visibilitySection, $calcSection, $navSection) -join "`n"
-            if (Test-Path -Path $llmViewsPath) {
-                $rulesText += "`n" + [System.IO.File]::ReadAllText($llmViewsPath)
+            $globalRuleFields = New-Object System.Collections.Generic.HashSet[string]
+            $fieldViewRules = @{} # fieldName -> { viewName -> $true }
+            
+            # Extract Views per field from the Fields table
+            $fieldsSection = Get-MarkdownSection -text $content -heading "Fields"
+            $fieldViews = @{}
+            if ($fieldsSection) {
+                $lines = $fieldsSection -split "\r?\n" | Select-Object -Skip 2
+                foreach ($line in $lines) {
+                    $cols = $line -split '\|'
+                    if ($cols.Count -ge 12) {
+                        $fldName = $cols[2].Trim()
+                        $views = $cols[11].Trim() -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+                        $fieldViews[$fldName] = @($views)
+                    }
+                }
             }
             
-            $ruleFields = @()
-            foreach ($m in [regex]::Matches($rulesText, '\[(?<f>[^\]]+)\]')) { $ruleFields += $m.Groups['f'].Value }
-            foreach ($m in [regex]::Matches($rulesText, 'On change of\s+\[?(?<f>[A-Za-z_][A-Za-z0-9_\-\.]+)\]?','IgnoreCase')) { $ruleFields += $m.Groups['f'].Value }
-            foreach ($m in [regex]::Matches($rulesText, 'Set\s+\[?(?<f>[A-Za-z_][A-Za-z0-9_\-\.]+)\]?\s*=','IgnoreCase')) { $ruleFields += $m.Groups['f'].Value }
-            foreach ($m in [regex]::Matches($rulesText, '\b([A-Za-z_][A-Za-z0-9_\-\.]{2,})\b')) { $ruleFields += $m.Groups[1].Value }
+            # 1. Action Rules (Logic): Trigger column (Global)
+            if ($actionRules) {
+                foreach ($line in $actionRules) {
+                    if ($line -match '^\|\s*On change of \[([^\]]+)\]') {
+                        [void]$globalRuleFields.Add($matches[1])
+                    }
+                }
+            }
             
-            $ruleFields = $ruleFields | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | Select-Object -Unique
+            # 2. Validation Rules: Field column (Col 2) (Global)
+            if ($validationSection) {
+                $lines = $validationSection -split "\r?\n" | Select-Object -Skip 2
+                foreach ($line in $lines) {
+                    $cols = $line -split '\|'
+                    if ($cols.Count -ge 3) { [void]$globalRuleFields.Add($cols[2].Trim()) }
+                }
+            }
             
-            $fieldsWithoutRules = @()
+            # 3. Read-only rules: Field (Col 2), View (Col 1)
+            if ($readOnlySection) {
+                $lines = $readOnlySection -split "\r?\n" | Select-Object -Skip 2
+                foreach ($line in $lines) {
+                    $cols = $line -split '\|'
+                    if ($cols.Count -ge 5) {
+                        $view = $cols[1].Trim()
+                        $fld = $cols[2].Trim()
+                        $act = $cols[4].Trim()
+                        if ($act -notmatch '(?i)Always \((read-only|hide|hidden)\)') {
+                            if ($fieldViewRules[$fld] -eq $null) { $fieldViewRules[$fld] = @{} }
+                            $fieldViewRules[$fld][$view] = $true
+                        }
+                    }
+                }
+            }
+            
+            # 4. Visibility rules: Section/Control (Col 2), View (Col 1)
+            if ($visibilitySection) {
+                $lines = $visibilitySection -split "\r?\n" | Select-Object -Skip 2
+                foreach ($line in $lines) {
+                    $cols = $line -split '\|'
+                    if ($cols.Count -ge 3) {
+                        $view = $cols[1].Trim()
+                        $fld = $cols[2].Trim()
+                        if ($fieldViewRules[$fld] -eq $null) { $fieldViewRules[$fld] = @{} }
+                        $fieldViewRules[$fld][$view] = $true
+                    }
+                }
+            }
+            
+            # 5. Calculations: Field column (Col 1) (Global)
+            if ($calcSection) {
+                $lines = $calcSection -split "\r?\n" | Select-Object -Skip 2
+                foreach ($line in $lines) {
+                    $cols = $line -split '\|'
+                    if ($cols.Count -ge 2) { [void]$globalRuleFields.Add($cols[1].Trim()) }
+                }
+            }
+            
+            $fieldsWithoutRulesOutput = @()
             foreach ($f in $fieldCandidates) {
-                if (-not ($ruleFields -contains $f)) { $fieldsWithoutRules += $f }
+                if ($globalRuleFields.Contains($f)) {
+                    # Has global rules, so it's never rule-free in any view.
+                    continue
+                }
+                
+                $viewsWithoutRules = @()
+                $allViews = @()
+                if ($fieldViews.ContainsKey($f)) {
+                    $allViews = $fieldViews[$f]
+                    foreach ($v in $allViews) {
+                        if (-not ($fieldViewRules[$f] -and $fieldViewRules[$f][$v])) {
+                            $viewsWithoutRules += $v
+                        }
+                    }
+                }
+                
+                if ($allViews.Count -gt 0 -and $viewsWithoutRules.Count -eq $allViews.Count) {
+                    # No rules in any of its views
+                    $fieldsWithoutRulesOutput += "- $f"
+                } elseif ($viewsWithoutRules.Count -gt 0) {
+                    # No rules in specific views
+                    $fieldsWithoutRulesOutput += "- $f (No rules in views: $($viewsWithoutRules -join ', '))"
+                } elseif ($allViews.Count -eq 0 -and (-not $fieldViewRules.ContainsKey($f))) {
+                    # Field is never used in any views, and has no rules
+                    $fieldsWithoutRulesOutput += "- $f (Not used in any views)"
+                }
             }
             
-            if ($fieldsWithoutRules.Count -gt 0) {
+            if ($fieldsWithoutRulesOutput.Count -gt 0) {
                 $body = "### Fields with NO rules detected`n`n"
-                $body += ($fieldsWithoutRules | Sort-Object | ForEach-Object { "- $_" }) -join "`n"
+                $body += ($fieldsWithoutRulesOutput | Sort-Object) -join "`n"
                 Save-Chunk "00-Fields-No-Rules.md" $body
             } else {
                 Save-Chunk "00-Fields-No-Rules.md" "### Fields with NO rules detected`n`n_None found._"
