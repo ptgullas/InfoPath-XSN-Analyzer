@@ -36,6 +36,9 @@ $scriptRoot = $PSScriptRoot
 if (-not $scriptRoot) { $scriptRoot = Split-Path -Parent -Path $MyInvocation.MyCommand.Path }
 if (-not $scriptRoot) { $scriptRoot = (Get-Location).Path }
 
+$outDir = Join-Path $scriptRoot 'output'
+if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
 # The people-picker / Contact Selector ActiveX control InfoPath stamps into list forms.
 $ContactSelectorClsid = '61e40d31-993d-4777-8fa0-19ca59b6d0bb'
 
@@ -1369,7 +1372,7 @@ function Analyze-Form {
     param([string]$XsnPath)
 
     $name = [System.IO.Path]::GetFileNameWithoutExtension($XsnPath)
-    $folder = Join-Path $scriptRoot $name
+    $folder = Join-Path $outDir $name
     Write-Host ("  Extracting and analyzing: {0}" -f $name)
 
     if (-not (Expand-Xsn -XsnPath $XsnPath -DestDir $folder)) {
@@ -1920,6 +1923,11 @@ function Analyze-Form {
     $md += (To-MdTable -Rows $logicSorted -Title 'Logic (when / if / then)')
     if (@($navigation).Count -gt 0) { $md += (To-MdTable -Rows $navigation -Title 'View navigation') }
     $md += (To-MdTable -Rows (@($fieldRows | Sort-Object @{e={$_.Status -ne 'Active'}}, Field)) -Title 'Fields')
+    $md += ''
+    $md += '### Field list'
+    $md += ''
+    $md += (@($fieldRows | Where-Object { $_.Status -eq 'Active' -and $_.Field } | Sort-Object Field | Select-Object -Unique) | ForEach-Object { "- $($_.Field)" }) -join "`n"
+    $md += ''
     if (@($structure).Count -gt 0) {
         $md += '### Form layout (sections, fields, labels, controls - in form order)'
         $md += ''
@@ -2124,8 +2132,10 @@ foreach ($f in $selected) {
 
 # Roll-up workbook
 if ($rollup.Count -gt 0) {
-    $rollupPath = Join-Path $scriptRoot '_AllForms-Summary.xlsx'
-    $rollupTmp = Join-Path $scriptRoot '~_AllForms-Summary.build.xlsx'
+    $outDir = Join-Path $scriptRoot 'output'
+    if (-not (Test-Path $outDir)) { New-Item -Path $outDir -ItemType Directory | Out-Null }
+    $rollupPath = Join-Path $outDir '_AllForms-Summary.xlsx'
+    $rollupTmp = Join-Path $outDir '~_AllForms-Summary.build.xlsx'
     [void](Remove-FileSafe $rollupTmp)
     try {
         $rollup | Sort-Object -Property Complexity -Descending |
@@ -2149,7 +2159,9 @@ if ($rollup.Count -gt 0) {
 # ----------------------------------------------------------------------------------------------
 #  Write the run log so any failure is visible and no missing logic goes unnoticed.
 # ----------------------------------------------------------------------------------------------
-$logPath = Join-Path $scriptRoot '_Analysis-Log.txt'
+$outDir = Join-Path $scriptRoot 'output'
+if (-not (Test-Path $outDir)) { New-Item -Path $outDir -ItemType Directory | Out-Null }
+$logPath = Join-Path $outDir '_Analysis-Log.txt'
 $errors = @($script:RunLog | Where-Object { $_.Severity -eq 'Error' })
 $warns = @($script:RunLog | Where-Object { $_.Severity -ne 'Error' })
 $skipped = @($selected | Where-Object { $analyzedNames -notcontains [System.IO.Path]::GetFileNameWithoutExtension($_.Name) })

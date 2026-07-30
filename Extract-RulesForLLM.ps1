@@ -27,7 +27,7 @@ param(
 )
 
 # Output directory for the LLM chunks
-$OutputBaseFolder = "LLM_Rules_Extracted"
+$OutputBaseFolder = "output\LLM_Rules_Extracted"
 
 # Determine if TargetDirectory is a single analysis folder or a parent folder
 $analysisDirs = @()
@@ -148,6 +148,43 @@ foreach ($dir in $analysisDirs) {
             Copy-Item -Path $llmViewsPath -Destination $xslOutputPath -Force
             Write-Host "  -> Copied XSL views to: $xslOutputPath"
         }
+
+        # --- start: compute fields that do NOT have rules and save a chunk ---
+        $fieldsSection = Get-MarkdownSection -text $content -heading "Field list"
+        
+        $fieldCandidates = @()
+        if ($fieldsSection) {
+            $fieldCandidates = [regex]::Matches($fieldsSection, '(?m)^-\s+(.+)$') | ForEach-Object { $_.Groups[1].Value.Trim() } | Select-Object -Unique
+        }
+
+        if ($fieldCandidates.Count -gt 0) {
+            $rulesText = ($logicSection, $validationSection, $readOnlySection, $visibilitySection, $calcSection, $navSection) -join "`n"
+            if (Test-Path -Path $llmViewsPath) {
+                $rulesText += "`n" + [System.IO.File]::ReadAllText($llmViewsPath)
+            }
+            
+            $ruleFields = @()
+            foreach ($m in [regex]::Matches($rulesText, '\[(?<f>[^\]]+)\]')) { $ruleFields += $m.Groups['f'].Value }
+            foreach ($m in [regex]::Matches($rulesText, 'On change of\s+\[?(?<f>[A-Za-z_][A-Za-z0-9_\-\.]+)\]?','IgnoreCase')) { $ruleFields += $m.Groups['f'].Value }
+            foreach ($m in [regex]::Matches($rulesText, 'Set\s+\[?(?<f>[A-Za-z_][A-Za-z0-9_\-\.]+)\]?\s*=','IgnoreCase')) { $ruleFields += $m.Groups['f'].Value }
+            foreach ($m in [regex]::Matches($rulesText, '\b([A-Za-z_][A-Za-z0-9_\-\.]{2,})\b')) { $ruleFields += $m.Groups[1].Value }
+            
+            $ruleFields = $ruleFields | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | Select-Object -Unique
+            
+            $fieldsWithoutRules = @()
+            foreach ($f in $fieldCandidates) {
+                if (-not ($ruleFields -contains $f)) { $fieldsWithoutRules += $f }
+            }
+            
+            if ($fieldsWithoutRules.Count -gt 0) {
+                $body = "### Fields with NO rules detected`n`n"
+                $body += ($fieldsWithoutRules | Sort-Object | ForEach-Object { "- $_" }) -join "`n"
+                Save-Chunk "00-Fields-No-Rules.md" $body
+            } else {
+                Save-Chunk "00-Fields-No-Rules.md" "### Fields with NO rules detected`n`n_None found._"
+            }
+        }
+        # --- end: compute fields that do NOT have rules and save a chunk ---
         
         Write-Host "Completed exporting rules for $($dir.Name)."
     }
