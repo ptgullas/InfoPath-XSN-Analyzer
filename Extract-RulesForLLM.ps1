@@ -27,7 +27,7 @@ param(
 )
 
 # Output directory for the LLM chunks
-$OutputBaseFolder = "output\LLM_Rules_Extracted"
+$OutputBaseFolder = "LLM_Rules_Extracted"
 
 # Determine if TargetDirectory is a single analysis folder or a parent folder
 $analysisDirs = @()
