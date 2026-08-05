@@ -36,6 +36,9 @@ $scriptRoot = $PSScriptRoot
 if (-not $scriptRoot) { $scriptRoot = Split-Path -Parent -Path $MyInvocation.MyCommand.Path }
 if (-not $scriptRoot) { $scriptRoot = (Get-Location).Path }
 
+$outDir = Join-Path $scriptRoot 'output'
+if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
 # The people-picker / Contact Selector ActiveX control InfoPath stamps into list forms.
 $ContactSelectorClsid = '61e40d31-993d-4777-8fa0-19ca59b6d0bb'
 
@@ -754,8 +757,19 @@ function Get-Logic {
             }
             $actionText = ($actions -join '; ')
             if (-not $actionText) { $actionText = '(no actions)' }
+
+            # Find which views this rule might "appear" on based on its trigger field or button.
+            $viewsForTrigger = ''
+            if ($trigger -match '\[(?<f>[^\]]+)\]') {
+                $tf = $Matches['f']
+                if ($fieldUsage -and $fieldUsage.ContainsKey($tf)) { $viewsForTrigger = ($fieldUsage[$tf] | Select-Object -Unique) -join ', ' }
+            } elseif ($trigger -match "on view '(?<v>[^']+)'") {
+                $viewsForTrigger = $Matches['v']
+            }
+
             $rows += [pscustomobject]@{
                 Trigger = $trigger
+                Views = $viewsForTrigger
                 Rule = $caption
                 Condition = $(if ($cond) { 'IF ' + $cond } else { '(always)' })
                 Actions = $actionText
@@ -816,8 +830,12 @@ function Get-Validation {
         $msg = ''
         $m = Sel1 $e './xsf:errorMessage' $Nsm
         if ($m) { $msg = Get-Attr $m 'shortMessage' }
+        $caption = ''
+        $c = Sel1 $e './processing-instruction("caption")' $Nsm
+        if ($c) { $caption = $c.Data.Trim() }
         $rows += [pscustomobject]@{
             Field = $field
+            Rule = $caption
             FailsWhen = To-PlainExpr (Get-Attr $e 'expression')
             Message = $msg
         }
@@ -1081,6 +1099,13 @@ function Analyze-Xsl {
         # Unconditional read-only.
         if ($bind -and $tag -match 'xd:disableEditing="yes"') { $readonly += [pscustomobject]@{ Field = $bind; Condition = ''; Caption = '' } }
         $controls += [pscustomobject]@{ Control = $ct; Field = $bind; Label = $label }
+
+        # Capture button-triggered ruleSets
+        $rsAction = [regex]::Match($tag, 'xd:xdxsfAction="(?<rs>[^"]*)"')
+        if ($rsAction.Success) {
+            $rsName = $rsAction.Groups['rs'].Value
+            $controls += [pscustomobject]@{ Control = "Rule Trigger ($rsName)"; Field = $bind; Label = $label }
+        }
     }
 
     # Formatting rule captions (human-readable names) from 'style' attributes.
@@ -1347,7 +1372,7 @@ function Analyze-Form {
     param([string]$XsnPath)
 
     $name = [System.IO.Path]::GetFileNameWithoutExtension($XsnPath)
-    $folder = Join-Path $scriptRoot $name
+    $folder = Join-Path $outDir $name
     Write-Host ("  Extracting and analyzing: {0}" -f $name)
 
     if (-not (Expand-Xsn -XsnPath $XsnPath -DestDir $folder)) {
@@ -1368,10 +1393,6 @@ function Analyze-Form {
     $primary = $null; try { $primary = Get-PrimaryFields $root $nsm } catch { Log-Issue $name 'PrimaryFields' $_.Exception.Message }
     $views = @(); try { $views = @(Get-Views $root $nsm) } catch { Log-Issue $name 'Views' $_.Exception.Message }
     $rsTrig = @{}; try { $rsTrig = Build-RuleSetTriggers $root $nsm } catch { Log-Issue $name 'Triggers' $_.Exception.Message }
-    $logic = $null; try { $logic = Get-Logic $root $nsm $rsTrig } catch { Log-Issue $name 'Logic' $_.Exception.Message }
-    $onLoad = @(); try { $onLoad = @(Get-OnLoadSummary $root $nsm $adapters) } catch { Log-Issue $name 'OnLoad' $_.Exception.Message }
-    $events = @(); try { $events = @(Get-EventHandlers $root $nsm) } catch { Log-Issue $name 'Events' $_.Exception.Message }
-    $calcs = @(); try { $calcs = @(Get-Calculations $root $nsm) } catch { Log-Issue $name 'Calcs' $_.Exception.Message }
     $valid = @(); try { $valid = @(Get-Validation $root $nsm) } catch { Log-Issue $name 'Validation' $_.Exception.Message }
     $schemaFields = @(); try { $schemaFields = @(Get-SchemaFields $folder $root $nsm) } catch { Log-Issue $name 'SchemaFields' $_.Exception.Message }
     $structure = @(); try { $structure = @(Get-FormStructure $folder $root $nsm) } catch { Log-Issue $name 'Structure' $_.Exception.Message }
@@ -1384,6 +1405,7 @@ function Analyze-Form {
     $visibilityRows = @()
     $dropdownRows = @()
     $readonlyRows = @()
+    $buttonTriggers = @{}
     $sectionTotal = 0
     $fieldUsage = @{}        # field -> list of views
     $controlByField = @{}    # field -> friendly control type (rich text, date picker, attachment...)
@@ -1396,6 +1418,13 @@ function Analyze-Form {
         if ($null -eq $xa) { continue }
         $sectionTotal += $xa.SectionCount
         foreach ($c in $xa.Controls) {
+            if ($c.Control -match 'Rule Trigger \((?<rs>.*)\)') {
+                $rsName = $Matches['rs']
+                if (-not $buttonTriggers.ContainsKey($rsName)) { $buttonTriggers[$rsName] = @() }
+                $lbl = $c.Label; if (-not $lbl) { $lbl = "Button" }
+                $buttonTriggers[$rsName] += "Click '$lbl' on view '$($v.View)'"
+                continue
+            }
             if (-not $c.Field) { continue }
             $fc = Friendly-Control $c.Control
             if ($fc -and $fc -ne 'Button' -and $fc -ne 'Section' -and -not $controlByField.ContainsKey($c.Field)) { $controlByField[$c.Field] = $fc }
@@ -1434,6 +1463,19 @@ function Analyze-Form {
     }
     $readonlyRows = @($readonlyRows | Sort-Object View, Field, ReadOnlyWhen -Unique)
 
+    # Merge button triggers into ruleSet triggers
+    foreach ($rs in $buttonTriggers.Keys) {
+        $trig = ($buttonTriggers[$rs] | Select-Object -Unique) -join '; '
+        if ($rsTrig.ContainsKey($rs)) { $rsTrig[$rs] += " (also: $trig)" }
+        else { $rsTrig[$rs] = $trig }
+    }
+
+    # ---- logic analysis (requires fieldUsage from XSL analysis) ----
+    $logic = $null; try { $logic = Get-Logic $root $nsm $rsTrig } catch { Log-Issue $name 'Logic' $_.Exception.Message }
+    $onLoad = @(); try { $onLoad = @(Get-OnLoadSummary $root $nsm $adapters) } catch { Log-Issue $name 'OnLoad' $_.Exception.Message }
+    $events = @(); try { $events = @(Get-EventHandlers $root $nsm) } catch { Log-Issue $name 'Events' $_.Exception.Message }
+    $calcs = @(); try { $calcs = @(Get-Calculations $root $nsm) } catch { Log-Issue $name 'Calcs' $_.Exception.Message }
+
     # ---- merge fields (list columns + schema), mark usage / unused / logic-only ----
     # collect every field name referenced by any logic expression (rules/calcs/validation/conditions)
     $logicRefs = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1467,6 +1509,19 @@ function Analyze-Form {
         if ($section -and -not $sectionByField.ContainsKey($s.Name)) { $sectionByField[$s.Name] = $section }
     }
 
+    # field -> human-readable validation-based requirements
+    $validationReqs = @{}
+    foreach ($v in $valid) {
+        # 'cannot be blank' rules (requiredness)
+        if ($v.FailsWhen -match 'is (blank|empty|""|"")' -or $v.FailsWhen -match '= ""' -or $v.Message -match 'Cannot be blank') {
+            if (-not $validationReqs.ContainsKey($v.Field)) { $validationReqs[$v.Field] = @() }
+            $label = $v.Rule; if (-not $label) { $label = 'Required' }
+            # If condition mentions a view, tag it.
+            if ($v.FailsWhen -match 'view-name is "(?<v>[^"]+)"') { $label += " (on view '$($Matches['v'])')" }
+            $validationReqs[$v.Field] += $label
+        }
+    }
+
     $fieldRows = @()
     $fieldSeen = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
     $complexCount = 0
@@ -1488,10 +1543,18 @@ function Analyze-Form {
         $lt = ''
         if ($f.PSObject.Properties.Name -contains 'LookupTarget') { $lt = $f.LookupTarget }
         $storage = $(if ($isListForm) { 'SharePoint column' } elseif ($promoted.ContainsKey($f.Name)) { "SharePoint column ($($promoted[$f.Name]))" } else { 'XML only' })
+        
+        $req = $(if ($f.Required) { 'Yes (schema)' } else { '' })
+        if ($validationReqs.ContainsKey($f.Name)) {
+            $vreq = ($validationReqs[$f.Name] | Select-Object -Unique) -join '; '
+            if ($req) { $req += "; " + $vreq } else { $req = "Conditional: " + $vreq }
+        }
+        if (-not $req) { $req = 'no' }
+
         $fieldRows += [pscustomobject]@{
             Section = $sectionByField[$f.Name]; Field = $f.Name; Label = $labelByField[$f.Name]; Type = $f.Type
             Control = $controlByField[$f.Name]; Storage = $storage; Complex = $f.IsComplex; LookupTarget = $lt
-            Required = $f.Required; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', '); Status = $status
+            Required = $req; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', '); Status = $status
         }
     }
     # add schema-only structural fields (library forms / repeating groups) not already covered
@@ -1505,10 +1568,18 @@ function Analyze-Form {
         $usedInViews = @()
         if ($fieldUsage.ContainsKey($f.Name)) { $usedInViews = $fieldUsage[$f.Name] | Select-Object -Unique }
         $storage = $(if ($isListForm) { 'SharePoint column' } elseif ($promoted.ContainsKey($f.Name)) { "SharePoint column ($($promoted[$f.Name]))" } else { 'XML only' })
+        
+        $req = $(if ($f.Nillable -eq $false) { 'Yes (schema)' } else { '' })
+        if ($validationReqs.ContainsKey($f.Name)) {
+            $vreq = ($validationReqs[$f.Name] | Select-Object -Unique) -join '; '
+            if ($req) { $req += "; " + $vreq } else { $req = "Conditional: " + $vreq }
+        }
+        if (-not $req) { $req = 'no' }
+
         $fieldRows += [pscustomobject]@{
             Section = $sectionByField[$f.Name]; Field = $f.Name; Label = $labelByField[$f.Name]; Type = $f.Type
             Control = $controlByField[$f.Name]; Storage = $storage; Complex = $false; LookupTarget = ''
-            Required = $false; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', ')
+            Required = $req; Default = $defaults[$f.Name]; UsedInViews = ($usedInViews -join ', ')
             Status = $(if ($usedInViews.Count -gt 0) { 'Active' } elseif ($f.Repeating) { 'Repeating group' } else { 'Structure only' })
         }
     }
@@ -1852,6 +1923,11 @@ function Analyze-Form {
     $md += (To-MdTable -Rows $logicSorted -Title 'Logic (when / if / then)')
     if (@($navigation).Count -gt 0) { $md += (To-MdTable -Rows $navigation -Title 'View navigation') }
     $md += (To-MdTable -Rows (@($fieldRows | Sort-Object @{e={$_.Status -ne 'Active'}}, Field)) -Title 'Fields')
+    $md += ''
+    $md += '### Field list'
+    $md += ''
+    $md += (@($fieldRows | Where-Object { $_.Status -eq 'Active' -and $_.Field } | Select-Object -ExpandProperty Field | Sort-Object -Unique) | ForEach-Object { "- $_" }) -join "`n"
+    $md += ''
     if (@($structure).Count -gt 0) {
         $md += '### Form layout (sections, fields, labels, controls - in form order)'
         $md += ''
@@ -2056,8 +2132,10 @@ foreach ($f in $selected) {
 
 # Roll-up workbook
 if ($rollup.Count -gt 0) {
-    $rollupPath = Join-Path $scriptRoot '_AllForms-Summary.xlsx'
-    $rollupTmp = Join-Path $scriptRoot '~_AllForms-Summary.build.xlsx'
+    $outDir = Join-Path $scriptRoot 'output'
+    if (-not (Test-Path $outDir)) { New-Item -Path $outDir -ItemType Directory | Out-Null }
+    $rollupPath = Join-Path $outDir '_AllForms-Summary.xlsx'
+    $rollupTmp = Join-Path $outDir '~_AllForms-Summary.build.xlsx'
     [void](Remove-FileSafe $rollupTmp)
     try {
         $rollup | Sort-Object -Property Complexity -Descending |
@@ -2081,7 +2159,9 @@ if ($rollup.Count -gt 0) {
 # ----------------------------------------------------------------------------------------------
 #  Write the run log so any failure is visible and no missing logic goes unnoticed.
 # ----------------------------------------------------------------------------------------------
-$logPath = Join-Path $scriptRoot '_Analysis-Log.txt'
+$outDir = Join-Path $scriptRoot 'output'
+if (-not (Test-Path $outDir)) { New-Item -Path $outDir -ItemType Directory | Out-Null }
+$logPath = Join-Path $outDir '_Analysis-Log.txt'
 $errors = @($script:RunLog | Where-Object { $_.Severity -eq 'Error' })
 $warns = @($script:RunLog | Where-Object { $_.Severity -ne 'Error' })
 $skipped = @($selected | Where-Object { $analyzedNames -notcontains [System.IO.Path]::GetFileNameWithoutExtension($_.Name) })
